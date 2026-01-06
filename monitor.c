@@ -10,31 +10,23 @@
 
 #define HISTORY_LEN 60  // 保存 60 个点
 
-/* ================= 列定义 ================= */
-enum {
-    COL_PID,
-    COL_NAME,
-    COL_CPU,
-    COL_MEM,
-    COL_DISK,
-    NUM_COLS
-};
 
-GtkListStore* store;
-GtkCellRendererText* renderers[NUM_COLS]; // 保存每列的渲染器
 
-/* ================= CPU Total ================= */
+typedef struct {
+    char model[128];
+    int cores;
+    int threads;
+} CpuInfo;
+
 typedef struct {
     long long total;
     long long idle;
 } CpuTotal;
 
-/* ================= Disk Total ================= */
 typedef struct {
     long long sectors;
 } DiskTotal;
 
-/* ================= 每个进程历史记录 ================= */
 typedef struct {
     long long utime, stime;
 } ProcCpu;
@@ -50,6 +42,23 @@ typedef struct {
     int index; // 下一个写入位置
 } PerfData;
 
+typedef enum {
+    PERF_CPU,
+    PERF_MEM,
+    PERF_DISK
+} PerfType;
+
+enum {
+    COL_PID,
+    COL_NAME,
+    COL_CPU,
+    COL_MEM,
+    COL_DISK,
+    NUM_COLS
+};
+
+PerfType current_perf = PERF_CPU;
+
 PerfData perf_data = { {0}, {0}, {0}, 0 };
 GtkWidget* perf_drawing_area;
 GtkWidget* perf_cpu_label;
@@ -57,6 +66,8 @@ GtkWidget* perf_mem_label;
 GtkWidget* perf_disk_label;
 
 /* ================= 全局变量 ================= */
+GtkListStore* store;//读到的进程数据
+GtkCellRendererText* renderers[NUM_COLS]; // 保存每列的渲染器
 GtkWidget* process_panel_box;  // 放在 Stack 中的进程面板 Box
 GtkWidget* process_tree_view;  // 进程列表 TreeView
 GtkWidget* performance_panel;  // 性能面板
@@ -96,6 +107,59 @@ void get_process_name(const char* pid, char* buf, size_t size)
     fclose(fp);
 }
 
+void get_cpu_info(CpuInfo* info)
+{
+    FILE* fp = fopen("/proc/cpuinfo", "r");
+    if (!fp) {
+        strcpy(info->model, "unknown");
+        info->cores = 0;
+        info->threads = 0;
+        return;
+    }
+
+    char line[256];
+    info->cores = 0;
+    info->threads = 0;
+    info->model[0] = '\0';
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "model name", 10) == 0 && info->model[0] == '\0') {
+            char* p = strchr(line, ':');
+            if (p) {
+                p += 2; // 跳过 ": "
+                strncpy(info->model, p, sizeof(info->model) - 1);
+                info->model[strcspn(info->model, "\n")] = 0;
+            }
+        }
+        else if (strncmp(line, "cpu cores", 9) == 0) {
+            int cores = 0;
+            sscanf(line, "cpu cores\t: %d", &cores);
+            info->cores = cores;
+        }
+        else if (strncmp(line, "processor", 9) == 0) {
+            info->threads++;
+        }
+    }
+
+    fclose(fp);
+}
+
+GtkWidget* create_cpu_info_label(GtkWidget* parent_box)
+{
+    CpuInfo info;
+    get_cpu_info(&info);
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "CPU: %s | 核心: %d | 逻辑处理器: %d",
+        info.model, info.cores, info.threads);
+
+    GtkWidget* info_label = gtk_label_new(buf);
+    gtk_box_pack_start(GTK_BOX(parent_box), info_label, FALSE, FALSE, 0);
+
+    return info_label;
+}
+
 /* 搜索框逻辑 */
 void on_search_changed(GtkEntry* entry, gpointer user_data) 
 {
@@ -104,7 +168,6 @@ void on_search_changed(GtkEntry* entry, gpointer user_data)
     gtk_tree_model_filter_refilter(GTK_TREE_MODEL_FILTER(filter_model));
 }
 
-/* 模糊搜索函数 */
 gboolean filter_visible_func(GtkTreeModel* model, GtkTreeIter* iter, gpointer data) 
 {
     if (search_text[0] == '\0') return TRUE;
@@ -141,16 +204,57 @@ gboolean filter_visible_func(GtkTreeModel* model, GtkTreeIter* iter, gpointer da
     return g_strrstr(buf, search_text) != NULL;
 }
 
-void on_btn_process_clicked_stack(GtkButton* button, gpointer user_data) 
+// 回调函数：切换 Stack 面板
+gboolean on_stack_row_clicked(GtkWidget* widget, GdkEventButton* event, gpointer user_data)
 {
-    GtkWidget* stack = GTK_WIDGET(user_data);
-    gtk_stack_set_visible_child_name(GTK_STACK(stack), "process");
+    gpointer* data = (gpointer*)user_data;
+    GtkWidget* stack = GTK_WIDGET(data[0]);
+    const char* name = (const char*)data[1];
+
+    gtk_stack_set_visible_child_name(GTK_STACK(stack), name);
+    return TRUE;
 }
 
-void on_btn_performance_clicked_stack(GtkButton* button, gpointer user_data) 
+// 创建可点击行
+GtkWidget* create_clickable_row(const char* text, GtkWidget* stack, const char* stack_name)
 {
-    GtkWidget* stack = GTK_WIDGET(user_data);
-    gtk_stack_set_visible_child_name(GTK_STACK(stack), "performance");
+    GtkWidget* label = gtk_label_new(text);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(label, 5);
+    gtk_widget_set_margin_top(label, 5);
+
+    GtkWidget* box = gtk_event_box_new(); // EventBox 让 Label 可点击
+    gtk_container_add(GTK_CONTAINER(box), label);
+
+    // 用数组传递 stack 和 name
+    gpointer* data = g_new(gpointer, 2);
+    data[0] = stack;
+    data[1] = (gpointer)stack_name;
+
+    g_signal_connect(box, "button-press-event",
+        G_CALLBACK(on_stack_row_clicked),
+        data);
+
+    return box;
+}
+
+/* ================= 结束任务 ================= */
+void on_kill_task_clicked(GtkButton* button, gpointer user_data) 
+{ 
+    if (selected_pid <= 0) 
+    { 
+        GtkWidget* dlg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING, GTK_BUTTONS_OK, "请先选择一个进程");
+        gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg); return; } 
+    if (kill(selected_pid, SIGTERM) == 0) 
+    {
+        g_print("已向 PID %d 发送 SIGTERM\n", selected_pid); 
+    } 
+    else 
+    { 
+        GtkWidget* dlg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "无法结束该进程（权限不足或受保护进程）");
+        gtk_dialog_run(GTK_DIALOG(dlg)); gtk_widget_destroy(dlg);
+    } 
 }
 
 void column_clicked(GtkTreeViewColumn* col, gpointer user_data) 
@@ -323,71 +427,80 @@ gint sort_name_func(GtkTreeModel* model, GtkTreeIter* a, GtkTreeIter* b, gpointe
     return ret;
 }
 
-/* ================= 结束任务 ================= */
-void on_kill_task_clicked(GtkButton* button, gpointer user_data) 
-{ 
-    if (selected_pid <= 0) 
-    { 
-        GtkWidget* dlg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING, GTK_BUTTONS_OK, "请先选择一个进程");
-        gtk_dialog_run(GTK_DIALOG(dlg));
-        gtk_widget_destroy(dlg); return; } 
-    if (kill(selected_pid, SIGTERM) == 0) 
-    {
-        g_print("已向 PID %d 发送 SIGTERM\n", selected_pid); 
-    } 
-    else 
-    { 
-        GtkWidget* dlg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "无法结束该进程（权限不足或受保护进程）");
-        gtk_dialog_run(GTK_DIALOG(dlg)); gtk_widget_destroy(dlg);
-    } 
+void on_perf_row_selected(GtkListBox* box, GtkListBoxRow* row, gpointer user_data)//性能类型选中
+{
+    if (!row) return;
+    current_perf = GPOINTER_TO_INT( g_object_get_data(G_OBJECT(row), "perf_type") );
+    gtk_widget_queue_draw(perf_drawing_area);
 }
 
+
 /* ================= 绘图函数 ================= */
+void draw_perf_line(cairo_t* cr, double* data_array, int start, int len,int h, double dx, double r, double g, double b, double scale)
+{
+    cairo_save(cr);
+    cairo_move_to(cr, 0, h);
+    for (int i = 0; i < len; i++) 
+    {
+        int idx = (start + i) % len;
+        double y = h * (1.0 - data_array[idx] / scale);
+        if (y < 0) y = 0;
+        cairo_line_to(cr, i * dx, y);
+    }
+    cairo_line_to(cr, (len - 1) * dx, h);
+    cairo_line_to(cr, 0, h);
+    cairo_close_path(cr);
+
+    cairo_pattern_t* pat = cairo_pattern_create_linear(0, 0, 0, h);
+    cairo_pattern_add_color_stop_rgba(pat, 0.0, r, g, b, 0.40); // 顶部alpha
+    cairo_pattern_add_color_stop_rgba(pat, 1.0, r, g, b, 0.35); // 底部alpha
+    cairo_set_source(cr, pat);
+    cairo_fill(cr);
+    cairo_pattern_destroy(pat);
+    cairo_restore(cr);
+
+    cairo_set_source_rgb(cr, r, g, b);
+    cairo_move_to(cr, 0, h * (1.0 - data_array[start] / scale));
+    for (int i = 0; i < len; i++) {
+        int idx = (start + i) % len;
+        double y = h * (1.0 - data_array[idx] / scale);
+        if (y < 0) y = 0;
+        cairo_line_to(cr, i * dx, y);
+    }
+    cairo_stroke(cr);
+}
+
 gboolean draw_performance(GtkWidget* widget, cairo_t* cr, gpointer data)
 {
     int w = gtk_widget_get_allocated_width(widget);
     int h = gtk_widget_get_allocated_height(widget);
 
-    // 背景
+    /* ===== 背景 ===== */
     cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
     cairo_paint(cr);
 
-    double dx = (double)w / HISTORY_LEN;
+    double dx = (double)w / (HISTORY_LEN - 1);
     int start = (perf_data.index + 1) % HISTORY_LEN;
 
-    // 红色：CPU
-    cairo_set_source_rgb(cr, 1, 0, 0);
-    cairo_move_to(cr, 0, h * (1 - perf_data.cpu[start] / 100.0));
-    for (int i = 0; i < HISTORY_LEN; i++) {
-        int idx = (start + i) % HISTORY_LEN;
-        cairo_line_to(cr, i * dx, h * (1 - perf_data.cpu[idx] / 100.0));
-    }
-    cairo_stroke(cr);
+    /* 线条更圆润 */
+    cairo_set_line_width(cr, 2.0);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
 
-    // 绿色：MEM
-    cairo_set_source_rgb(cr, 0, 1, 0);
-    cairo_move_to(cr, 0, h * (1 - perf_data.mem[start] / 100.0));
-    for (int i = 0; i < HISTORY_LEN; i++) {
-        int idx = (start + i) % HISTORY_LEN;
-        cairo_line_to(cr, i * dx, h * (1 - perf_data.mem[idx] / 100.0));
+    switch (current_perf) {
+    case PERF_CPU:
+        draw_perf_line(cr, perf_data.cpu, start, HISTORY_LEN, h, dx, 0.3, 0.6, 1.0, 100.0);
+        break;
+    case PERF_MEM:
+        draw_perf_line(cr, perf_data.mem, start, HISTORY_LEN, h, dx, 0.05, 0.2, 0.6, 100.0);
+        break;
+    case PERF_DISK:
+        draw_perf_line(cr, perf_data.disk, start, HISTORY_LEN, h, dx, 0.3, 0.8, 0.6, 1024.0);
+        break;
     }
-    cairo_stroke(cr);
-
-    // 蓝色：Disk（KB/s，假设最大 1024 KB/s）
-    cairo_set_source_rgb(cr, 0, 0, 1);
-    cairo_move_to(cr, 0, h * (1 - perf_data.disk[start] / 1024.0));
-    for (int i = 0; i < HISTORY_LEN; i++) {
-        int idx = (start + i) % HISTORY_LEN;
-        double y = h * (1 - perf_data.disk[idx] / 1024.0);
-        if (y < 0) y = 0;
-        cairo_line_to(cr, i * dx, y);
-    }
-    cairo_stroke(cr);
 
     return FALSE;
 }
-
-
 
 /* ================= 进程列表更新 ================= */
 gboolean update_process_list(gpointer data)
@@ -520,7 +633,6 @@ gboolean update_process_list(gpointer data)
 /* ================= 系统状态刷新 ================= */
 gboolean update_system_total(gpointer user_data)
 {
-    GtkWidget* labels = GTK_WIDGET(user_data); // 因为你传递的是 sys_label
     CpuTotal cur_cpu = get_cpu_total();
     DiskTotal cur_disk = get_disk_total();
     static CpuTotal prev_cpu = { 0 };
@@ -537,7 +649,7 @@ gboolean update_system_total(gpointer user_data)
 
     if (prev_disk.sectors > 0) {
         long long sec_diff = cur_disk.sectors - prev_disk.sectors;
-        disk_kb = sec_diff * 512.0 / 1024.0; // KB/s
+        disk_kb = sec_diff * 512.0 / 1024.0;
     }
 
     prev_cpu = cur_cpu;
@@ -545,14 +657,15 @@ gboolean update_system_total(gpointer user_data)
 
     double mem_p = get_mem_percent();
 
-    // 更新历史数据
+    /* 更新历史数据 */
     perf_data.cpu[perf_data.index] = cpu_p;
     perf_data.mem[perf_data.index] = mem_p;
     perf_data.disk[perf_data.index] = disk_kb;
     perf_data.index = (perf_data.index + 1) % HISTORY_LEN;
 
-    // 更新左侧标签
-    char buf[128];
+    /* 更新性能面板标签 */
+    char buf[64];
+
     snprintf(buf, sizeof(buf), "CPU %.1f%% %.2f GHz", cpu_p, 1.4);
     gtk_label_set_text(GTK_LABEL(perf_cpu_label), buf);
 
@@ -562,11 +675,50 @@ gboolean update_system_total(gpointer user_data)
     snprintf(buf, sizeof(buf), "磁盘 %.1f KB/s", disk_kb);
     gtk_label_set_text(GTK_LABEL(perf_disk_label), buf);
 
-    // 刷新折线图
     gtk_widget_queue_draw(perf_drawing_area);
 
     return TRUE;
 }
+
+gboolean update_system_summary(gpointer user_data)
+{
+    GtkWidget* sys_label = GTK_WIDGET(user_data);
+
+    static CpuTotal prev_cpu = { 0 };
+    static DiskTotal prev_disk = { 0 };
+
+    CpuTotal cur_cpu = get_cpu_total();
+    DiskTotal cur_disk = get_disk_total();
+
+    double cpu_p = 0.0, disk_kb = 0.0;
+
+    if (prev_cpu.total > 0) {
+        long long total_diff = cur_cpu.total - prev_cpu.total;
+        long long idle_diff = cur_cpu.idle - prev_cpu.idle;
+        if (total_diff > 0)
+            cpu_p = 100.0 * (1.0 - (double)idle_diff / total_diff);
+    }
+
+    if (prev_disk.sectors > 0) {
+        long long sec_diff = cur_disk.sectors - prev_disk.sectors;
+        disk_kb = sec_diff * 512.0 / 1024.0;
+    }
+
+    prev_cpu = cur_cpu;
+    prev_disk = cur_disk;
+
+    double mem_p = get_mem_percent();
+
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+        "System Total | CPU: %.1f%% | MEM: %.1f%% | Disk: %.1f KB/s",
+        cpu_p, mem_p, disk_kb);
+
+    gtk_label_set_text(GTK_LABEL(sys_label), buf);
+
+    return TRUE;
+}
+
 
 //进程面板渲染
 GtkWidget* create_process_panel()
@@ -632,7 +784,7 @@ GtkWidget* create_process_panel()
 
     // 定时刷新
     g_timeout_add_seconds(flash_time, update_process_list, NULL);
-    g_timeout_add_seconds(flash_time, update_system_total, sys_label);
+    g_timeout_add_seconds(flash_time, update_system_summary, sys_label);
 
     return process_panel_box;
 }
@@ -642,35 +794,72 @@ GtkWidget* create_performance_panel()
 {
     GtkWidget* panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
 
-    // 左侧资源列表
-    GtkWidget* left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    gtk_box_pack_start(GTK_BOX(panel), left_box, FALSE, FALSE, 5);
+    /* ================= 左侧资源列表（无框可点） ================= */
+    GtkWidget* perf_list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(perf_list),
+        GTK_SELECTION_SINGLE);
+    gtk_widget_set_size_request(perf_list, 180, -1);
+    gtk_box_pack_start(GTK_BOX(panel), perf_list, FALSE, FALSE, 5);
 
+    /* CPU */
+    GtkWidget* row = gtk_list_box_row_new();
     perf_cpu_label = gtk_label_new("CPU 0% 0.00 GHz");
+    gtk_container_add(GTK_CONTAINER(row), perf_cpu_label);
+    gtk_widget_set_margin_start(perf_cpu_label, 10);
+    gtk_widget_set_margin_top(perf_cpu_label, 8);
+    gtk_widget_set_margin_bottom(perf_cpu_label, 8);
+    g_object_set_data(G_OBJECT(row), "perf_type",
+        GINT_TO_POINTER(PERF_CPU));
+    gtk_list_box_insert(GTK_LIST_BOX(perf_list), row, -1);
+
+    /* 内存 */
+    row = gtk_list_box_row_new();
     perf_mem_label = gtk_label_new("内存 0% 0.0 GB");
+    gtk_container_add(GTK_CONTAINER(row), perf_mem_label);
+    gtk_widget_set_margin_start(perf_mem_label, 10);
+    gtk_widget_set_margin_top(perf_mem_label, 8);
+    gtk_widget_set_margin_bottom(perf_mem_label, 8);
+    g_object_set_data(G_OBJECT(row), "perf_type",
+        GINT_TO_POINTER(PERF_MEM));
+    gtk_list_box_insert(GTK_LIST_BOX(perf_list), row, -1);
+
+    /* 磁盘 */
+    row = gtk_list_box_row_new();
     perf_disk_label = gtk_label_new("磁盘 0 KB/s");
+    gtk_container_add(GTK_CONTAINER(row), perf_disk_label);
+    gtk_widget_set_margin_start(perf_disk_label, 10);
+    gtk_widget_set_margin_top(perf_disk_label, 8);
+    gtk_widget_set_margin_bottom(perf_disk_label, 8);
+    g_object_set_data(G_OBJECT(row), "perf_type",
+        GINT_TO_POINTER(PERF_DISK));
+    gtk_list_box_insert(GTK_LIST_BOX(perf_list), row, -1);
 
-    gtk_box_pack_start(GTK_BOX(left_box), perf_cpu_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(left_box), perf_mem_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(left_box), perf_disk_label, FALSE, FALSE, 0);
+    /* 默认选中 CPU */
+    gtk_list_box_select_row(GTK_LIST_BOX(perf_list),
+        gtk_list_box_get_row_at_index(GTK_LIST_BOX(perf_list), 0));
 
-    // 右侧折线图 + 详细信息
+    g_signal_connect(perf_list, "row-selected",
+        G_CALLBACK(on_perf_row_selected), NULL);
+
+    /* ================= 右侧折线图区域 ================= */
     GtkWidget* right_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_box_pack_start(GTK_BOX(panel), right_box, TRUE, TRUE, 0);
 
     perf_drawing_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(perf_drawing_area, 600, 400);
-    gtk_box_pack_start(GTK_BOX(right_box), perf_drawing_area, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(right_box),
+        perf_drawing_area, TRUE, TRUE, 0);
 
-    g_signal_connect(perf_drawing_area, "draw", G_CALLBACK(draw_performance), NULL);
+    g_signal_connect(perf_drawing_area, "draw",
+        G_CALLBACK(draw_performance), NULL);
 
-    // 可选：右下角详细信息（CPU型号、核心数等）
-    GtkWidget* info_label = gtk_label_new("CPU: i9-12900H 12th Gen | 内核: 14 | 逻辑处理器: 20");
-    gtk_box_pack_start(GTK_BOX(right_box), info_label, FALSE, FALSE, 0);
+    /* 右下角详细信息 */
+    GtkWidget* info_label = create_cpu_info_label(right_box);//cpu信息读
+    gtk_box_pack_start(GTK_BOX(right_box),
+        info_label, FALSE, FALSE, 0);
 
     return panel;
 }
-
 
 /* ================= 主函数 ================= */
 int main(int argc, char* argv[])
@@ -678,8 +867,6 @@ int main(int argc, char* argv[])
     gtk_init(&argc, &argv);
     cpu_table = g_hash_table_new(g_direct_hash, g_direct_equal);
     io_table = g_hash_table_new(g_direct_hash, g_direct_equal);
-
-
 
     GtkWidget* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "Linux任务管理器");
@@ -689,18 +876,38 @@ int main(int argc, char* argv[])
     GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_container_add(GTK_CONTAINER(win), hbox);
 
-    // 左侧按钮
-    GtkWidget* left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_widget_set_size_request(left_box, 100, -1);
-    gtk_box_pack_start(GTK_BOX(hbox), left_box, FALSE, FALSE, 0);
-
-    GtkWidget* btn_process = gtk_button_new_with_label("进程");
-    GtkWidget* btn_performance = gtk_button_new_with_label("性能");
-    gtk_box_pack_start(GTK_BOX(left_box), btn_process, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(left_box), btn_performance, FALSE, FALSE, 0);
-
-    // 右侧 Stack
+    /* ===== 面板选项 ===== */
     GtkWidget* stack = gtk_stack_new();
+    GtkWidget* left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_widget_set_size_request(left_box, 150, -1); // 宽度加大到 220
+    gtk_box_pack_start(GTK_BOX(hbox), left_box, FALSE, FALSE, 5);
+
+    GtkWidget* btn_list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(btn_list), GTK_SELECTION_NONE);
+    gtk_box_pack_start(GTK_BOX(left_box), btn_list, FALSE, FALSE, 0);
+
+    // 创建可点击行，增加字体大小和行高
+    GtkWidget* row_process = create_clickable_row("进程", stack, "process");
+    GtkWidget* row_performance = create_clickable_row("性能", stack, "performance");
+
+    // 设置行高度
+    gtk_widget_set_size_request(row_process, -1, 40);     // 行高 60
+    gtk_widget_set_size_request(row_performance, -1, 40); // 行高 60
+
+    // 设置字体更大
+    GtkWidget* label_process = gtk_bin_get_child(GTK_BIN(row_process));
+    GtkWidget* label_perf = gtk_bin_get_child(GTK_BIN(row_performance));
+
+    PangoAttrList* attrs = pango_attr_list_new();
+    PangoAttribute* font_attr = pango_attr_size_new_absolute(28 * PANGO_SCALE); // 28px
+    pango_attr_list_insert(attrs, font_attr);
+    gtk_label_set_attributes(GTK_LABEL(label_process), attrs);
+    gtk_label_set_attributes(GTK_LABEL(label_perf), attrs);
+    pango_attr_list_unref(attrs);
+
+    gtk_list_box_insert(GTK_LIST_BOX(btn_list), row_process, -1);
+    gtk_list_box_insert(GTK_LIST_BOX(btn_list), row_performance, -1);
+
     gtk_box_pack_start(GTK_BOX(hbox), stack, TRUE, TRUE, 0);
 
     // 渲染进程面板
@@ -711,12 +918,10 @@ int main(int argc, char* argv[])
     performance_panel = create_performance_panel();
     gtk_stack_add_named(GTK_STACK(stack), performance_panel, "performance");
 
+    g_timeout_add_seconds(flash_time, update_system_total, NULL);
+
     // 默认显示进程面板
     gtk_stack_set_visible_child(GTK_STACK(stack), process_panel);
-
-    // 面板切换
-    g_signal_connect(btn_process, "clicked",G_CALLBACK(on_btn_process_clicked_stack), stack);
-    g_signal_connect(btn_performance, "clicked",G_CALLBACK(on_btn_performance_clicked_stack), stack);
 
     gtk_widget_show_all(win);
     gtk_main();
