@@ -26,6 +26,13 @@ typedef struct {
     long long cached;
     long long swap_total;
     long long swap_free;
+
+    long long active;
+    long long inactive;
+    long long slab;
+    long long shmem;
+    long long sreclaimable;
+    long long sunreclaim;
 } MemStat;
 
 typedef struct {
@@ -145,6 +152,7 @@ void on_row_selected(GtkTreeView* treeview, gpointer user_data)
 {
     is_selection = 1; // 允许 update_process_list 保持选中
 }
+
 /* 搜索框逻辑 */
 void on_search_changed(GtkEntry* entry, gpointer user_data) 
 {
@@ -433,7 +441,7 @@ double get_mem_percent()
     return total ? 100.0 * (total - avail) / total : 0.0;
 }
 
-int get_mem_stat(MemStat* m)//性能-内存-详细信息获取
+int get_mem_stat(MemStat* m)
 {
     FILE* fp = fopen("/proc/meminfo", "r");
     if (!fp) return 0;
@@ -452,11 +460,18 @@ int get_mem_stat(MemStat* m)//性能-内存-详细信息获取
         else if (strcmp(key, "Cached:") == 0) m->cached = value;
         else if (strcmp(key, "SwapTotal:") == 0) m->swap_total = value;
         else if (strcmp(key, "SwapFree:") == 0) m->swap_free = value;
+        else if (strcmp(key, "Active:") == 0) m->active = value;
+        else if (strcmp(key, "Inactive:") == 0) m->inactive = value;
+        else if (strcmp(key, "Slab:") == 0) m->slab = value;
+        else if (strcmp(key, "Shmem:") == 0) m->shmem = value;
+        else if (strcmp(key, "SReclaimable:") == 0) m->sreclaimable = value;
+        else if (strcmp(key, "SUnreclaim:") == 0) m->sunreclaim = value;
     }
 
     fclose(fp);
     return 1;
 }
+
 /* ================= 系统磁盘 ================= */
 DiskTotal get_disk_total() 
 {
@@ -825,8 +840,8 @@ gboolean update_system_total(gpointer user_data)
     /* 更新性能面板标签 */
     char buf[64];
 
-    snprintf(buf, sizeof(buf), "CPU %.1f%% %.2f GHz", cpu_p, 1.4);
-    gtk_label_set_text(GTK_LABEL(perf_cpu_label), buf);
+    //snprintf(buf, sizeof(buf), "CPU %.1f%% %.2f GHz", cpu_p, 1.4);
+    //gtk_label_set_text(GTK_LABEL(perf_cpu_label), buf);
 
     snprintf(buf, sizeof(buf), "内存 %.1f%% %.1f GB", mem_p, 16.5);
     gtk_label_set_text(GTK_LABEL(perf_mem_label), buf);
@@ -866,24 +881,44 @@ gboolean update_memory_info(gpointer data)
     MemStat m;
     if (!get_mem_stat(&m)) return TRUE;
 
-    // 转 GB（MemInfo 是 KB）
-    double used = (m.mem_total - m.mem_free - m.buffers - m.cached) / 1024.0 / 1024.0;
-    double avail = (m.mem_free + m.buffers + m.cached) / 1024.0 / 1024.0;
-    double cache = (m.buffers + m.cached) / 1024.0 / 1024.0;
-    double swap = (m.swap_total - m.swap_free) / 1024.0 / 1024.0;
+    // 转 GB
+    double mem_total_gb = m.mem_total / 1024.0 / 1024.0;
+    double mem_free_gb = m.mem_free / 1024.0 / 1024.0;
+    double buffers_gb = m.buffers / 1024.0 / 1024.0;
+    double cached_gb = m.cached / 1024.0 / 1024.0;
+    double swap_total_gb = m.swap_total / 1024.0 / 1024.0;
+    double swap_free_gb = m.swap_free / 1024.0 / 1024.0;
 
-    char buf[256];
+    double mem_used_gb = mem_total_gb - mem_free_gb - buffers_gb - cached_gb;
+    double mem_available_gb = mem_free_gb + buffers_gb + cached_gb;
+    double swap_used_gb = swap_total_gb - swap_free_gb;
+
+    double mem_used_percent = (mem_used_gb / mem_total_gb) * 100.0;
+    double swap_used_percent = (swap_total_gb > 0) ? (swap_used_gb / swap_total_gb * 100.0) : 0.0;
+
+    char buf[512];
     snprintf(buf, sizeof(buf),
-        "已用内存:  %.2f GB\n"
-        "可用内存: %.2f GB\n"
-        "缓存:      %.2f GB\n"
-        "交换空间:  %.2f GB",
-        used, avail, cache, swap);
+        "内存总量:  %.2f GB\n"
+        "已用内存:  %.2f GB (%.1f%%)\n"
+        "可用内存:  %.2f GB\n"
+        "缓冲区+缓存: %.2f GB\n"
+        "交换总量:  %.2f GB\n"
+        "已用交换:  %.2f GB (%.1f%%)",
+        mem_total_gb,
+        mem_used_gb, mem_used_percent,
+        mem_available_gb,
+        buffers_gb + cached_gb,
+        swap_total_gb,
+        swap_used_gb, swap_used_percent
+    );
 
-    gtk_label_set_text(GTK_LABEL(mem_info_label), buf);
+    // 安全检查，确保 mem_info_label 是 GtkLabel
+    if (GTK_IS_LABEL(mem_info_label))
+        gtk_label_set_text(GTK_LABEL(mem_info_label), buf);
 
     return TRUE;
 }
+
 
 gboolean update_disk_info(gpointer user_data)
 {
@@ -949,6 +984,7 @@ GtkWidget* create_cpu_info_label(GtkWidget* parent)
 //进程面板
 GtkWidget* create_process_panel()
 {
+
     process_panel_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
 
     // 系统状态标签
@@ -979,21 +1015,19 @@ GtkWidget* create_process_panel()
     // ------------------ 底部搜索 + 结束任务 ------------------
     GtkWidget* bottom_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
 
-    // 左侧搜索框
     GtkWidget* search_label = gtk_label_new("搜索：");
     search_entry = gtk_entry_new();
     gtk_box_pack_start(GTK_BOX(bottom_box), search_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(bottom_box), search_entry, TRUE, TRUE, 0);
     g_signal_connect(search_entry, "changed", G_CALLBACK(on_search_changed), NULL);
 
-    // 右侧结束任务按钮
     GtkWidget* kill_btn = gtk_button_new_with_label("结束任务");
     g_signal_connect(kill_btn, "clicked", G_CALLBACK(on_kill_task_clicked), NULL);
     gtk_box_pack_end(GTK_BOX(bottom_box), kill_btn, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(process_panel_box), bottom_box, FALSE, FALSE, 5);
 
-    // 列标题及渲染器
+    // ------------------ 列标题及渲染器 ------------------
     const char* titles[NUM_COLS] = { "PID", "Name", "CPU%", "MEM%", "Disk KB/s" };
     for (int i = 0; i < NUM_COLS; i++) {
         GtkTreeViewColumn* col = gtk_tree_view_column_new();
@@ -1008,9 +1042,8 @@ GtkWidget* create_process_panel()
         gtk_tree_view_column_set_sort_column_id(col, i);
     }
 
-    g_signal_connect(process_tree_view, "cursor-changed", G_CALLBACK(on_row_selected), NULL);//绑定点击事件
+    g_signal_connect(process_tree_view, "cursor-changed", G_CALLBACK(on_row_selected), NULL);
 
-    // 定时刷新
     g_timeout_add_seconds(flash_time, update_process_list, NULL);
     g_timeout_add_seconds(flash_time, update_system_summary, sys_label);
 
